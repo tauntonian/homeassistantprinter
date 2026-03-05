@@ -16,8 +16,43 @@ mqtt:
       state_topic: "homeassistant/printer/paper"
       icon: mdi:paper-roll
 
+    - name: "Printer Firmware Version"
+      unique_id: qr204_version
+      state_topic: "homeassistant/printer/version"
+      icon: mdi:chip
+
+    - name: "Printer OTA Progress"
+      unique_id: qr204_ota_progress
+      state_topic: "homeassistant/printer/ota/progress"
+      unit_of_measurement: "%"
+      icon: mdi:progress-download
+
 # ── 2. Scripts ─────────────────────────────────────────────────────────────────
 script:
+
+  # ── HTTP pull OTA — fetch and flash a .bin from a URL ──────────────────────
+  printer_ota_update:
+    alias: "Printer: OTA Firmware Update"
+    description: "Flash new firmware from a URL. Host the .bin on your local network first."
+    fields:
+      url:
+        description: "Full HTTP URL to the compiled .bin file"
+        example: "http://192.168.1.100:8080/firmware.bin"
+    sequence:
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/printer/cmd/ota"
+          payload_template: '{"url":"{{ url }}"}'
+
+  # ── Remote restart ──────────────────────────────────────────────────────────
+  printer_restart:
+    alias: "Printer: Restart ESP32"
+    description: "Cleanly reboot the ESP32 without a firmware change"
+    sequence:
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/printer/cmd/restart"
+          payload: "reboot"
 
   # ── Print a custom message ──────────────────────────────────────────────────
   printer_custom_message:

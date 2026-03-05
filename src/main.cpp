@@ -10,14 +10,29 @@
  *   homeassistant/printer/cmd/qrcode     - Print QR code (JSON: {"data":"...","label":"..."})
  *   homeassistant/printer/cmd/image      - Print bitmap image (JSON: {"bitmap":[...],"width":...,"height":...})
  *   homeassistant/printer/cmd/raw        - Raw ESC/POS bytes as base64 string
+ *   homeassistant/printer/cmd/ota        - HTTP pull OTA (JSON: {"url":"http://...firmware.bin"})
+ *   homeassistant/printer/cmd/restart    - Reboot the ESP32 (any payload)
  *
  * MQTT Topics (publish):
- *   homeassistant/printer/status         - "online" / "offline" / "printing" / "error"
+ *   homeassistant/printer/status         - "online" / "offline" / "printing" / "error" / "ota"
  *   homeassistant/printer/paper          - "ok" / "low" / "out"
+ *   homeassistant/printer/version        - Firmware version string (published on connect)
+ *   homeassistant/printer/ota/progress   - OTA progress 0–100 (published during HTTP OTA)
+ *
+ * OTA update methods:
+ *   1. ArduinoOTA (push) — use `pio run -t upload --upload-port <IP>` or Arduino IDE
+ *      Password set in secrets.h as OTA_PASSWORD
+ *   2. HTTP pull OTA    — publish {"url":"http://host/firmware.bin"} to cmd/ota
+ *      The ESP fetches and flashes the binary, then reboots automatically.
  */
+
+#define FIRMWARE_VERSION "1.1.0"
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <HTTPClient.h>
+#include <Update.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <HardwareSerial.h>
@@ -25,21 +40,28 @@
 #include "secrets.h"  // WiFi + MQTT credentials
 
 // ── Pin config ────────────────────────────────────────────────────────────────
-// XIAO ESP32-C3 UART1: TX=D6(GPIO21), RX=D7(GPIO20)
-#define PRINTER_TX 21
-#define PRINTER_RX 20
+// XIAO ESP32-C3 pinout (confirmed from datasheet diagram):
+//   D6 = GPIO21 = UART TX  → connect to printer RX (white wire)
+//   D7 = GPIO20 = UART RX  → connect to printer TX (green wire)
+// NOTE: D6 is labelled "TX" and D7 is labelled "RX" on the board silkscreen.
+#define PRINTER_TX 21   // D6
+#define PRINTER_RX 20   // D7
 #define PRINTER_BAUD 9600   // QR204 default — change to 115200 if reconfigured
 
 // ── MQTT ──────────────────────────────────────────────────────────────────────
 #define MQTT_TOPIC_BASE     "homeassistant/printer"
 #define MQTT_TOPIC_STATUS   MQTT_TOPIC_BASE "/status"
 #define MQTT_TOPIC_PAPER    MQTT_TOPIC_BASE "/paper"
+#define MQTT_TOPIC_VERSION  MQTT_TOPIC_BASE "/version"
+#define MQTT_TOPIC_OTA_PROG MQTT_TOPIC_BASE "/ota/progress"
 #define MQTT_CMD_TEXT       MQTT_TOPIC_BASE "/cmd/text"
 #define MQTT_CMD_SHOPPING   MQTT_TOPIC_BASE "/cmd/shopping"
 #define MQTT_CMD_RECIPE     MQTT_TOPIC_BASE "/cmd/recipe"
 #define MQTT_CMD_QRCODE     MQTT_TOPIC_BASE "/cmd/qrcode"
 #define MQTT_CMD_IMAGE      MQTT_TOPIC_BASE "/cmd/image"
 #define MQTT_CMD_RAW        MQTT_TOPIC_BASE "/cmd/raw"
+#define MQTT_CMD_OTA        MQTT_TOPIC_BASE "/cmd/ota"
+#define MQTT_CMD_RESTART    MQTT_TOPIC_BASE "/cmd/restart"
 
 WiFiClient wifiClient;
 PubSubClient mqtt(wifiClient);
@@ -50,6 +72,7 @@ unsigned long lastReconnectAttempt = 0;
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void connectWiFi();
+void setupArduinoOTA();
 bool mqttReconnect();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void printText(JsonDocument& doc);
@@ -58,7 +81,9 @@ void printRecipe(JsonDocument& doc);
 void printQRCode(JsonDocument& doc);
 void printImage(JsonDocument& doc);
 void printRaw(const char* b64);
+void handleHttpOta(const char* url);
 void publishStatus(const char* status);
+void publishProgress(int pct);
 String base64Decode(const char* encoded);
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -68,15 +93,20 @@ void setup() {
   printer.begin();
 
   connectWiFi();
+  setupArduinoOTA();   // ArduinoOTA must start after WiFi
+
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(8192);  // Large buffer for images
   mqttReconnect();
   publishStatus("online");
+  mqtt.publish(MQTT_TOPIC_VERSION, FIRMWARE_VERSION, true);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
+  ArduinoOTA.handle();  // Must be called every loop for push OTA to work
+
   if (WiFi.status() != WL_CONNECTED) connectWiFi();
 
   if (!mqtt.connected()) {
@@ -105,7 +135,49 @@ void connectWiFi() {
   }
 }
 
-// ── MQTT ──────────────────────────────────────────────────────────────────────
+// ── ArduinoOTA (push OTA from PlatformIO / Arduino IDE) ──────────────────────
+void setupArduinoOTA() {
+  ArduinoOTA.setHostname("esp32-printer");
+  ArduinoOTA.setPassword(OTA_PASSWORD);  // defined in secrets.h
+
+  ArduinoOTA.onStart([]() {
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
+    Serial.printf("OTA start: %s\n", type.c_str());
+    publishStatus("ota");
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA complete — rebooting");
+    publishStatus("offline");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    int pct = (done * 100) / total;
+    Serial.printf("OTA progress: %d%%\r", pct);
+    // Throttle MQTT publishes to every 10% to avoid flooding the broker
+    static int lastPct = -1;
+    if (pct / 10 != lastPct / 10) {
+      publishProgress(pct);
+      lastPct = pct;
+    }
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error [%u]: ", error);
+    if      (error == OTA_AUTH_ERROR)    Serial.println("Auth failed");
+    else if (error == OTA_BEGIN_ERROR)   Serial.println("Begin failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive failed");
+    else if (error == OTA_END_ERROR)     Serial.println("End failed");
+    publishStatus("error");
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("ArduinoOTA ready — hostname: esp32-printer  IP: %s\n",
+                WiFi.localIP().toString().c_str());
+}
+
+// ── MQTT connection ───────────────────────────────────────────────────────────
 bool mqttReconnect() {
   if (mqtt.connect("esp32_printer", MQTT_USER, MQTT_PASS,
                    MQTT_TOPIC_STATUS, 0, true, "offline")) {
@@ -116,7 +188,10 @@ bool mqttReconnect() {
     mqtt.subscribe(MQTT_CMD_QRCODE);
     mqtt.subscribe(MQTT_CMD_IMAGE);
     mqtt.subscribe(MQTT_CMD_RAW);
+    mqtt.subscribe(MQTT_CMD_OTA);
+    mqtt.subscribe(MQTT_CMD_RESTART);
     publishStatus("online");
+    mqtt.publish(MQTT_TOPIC_VERSION, FIRMWARE_VERSION, true);
     return true;
   }
   Serial.printf("MQTT failed, rc=%d\n", mqtt.state());
@@ -127,10 +202,45 @@ void publishStatus(const char* status) {
   mqtt.publish(MQTT_TOPIC_STATUS, status, true);
 }
 
+void publishProgress(int pct) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d", pct);
+  mqtt.publish(MQTT_TOPIC_OTA_PROG, buf, false);
+}
+
 // ── MQTT callback dispatcher ──────────────────────────────────────────────────
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  publishStatus("printing");
   String t(topic);
+
+  // ── Restart command — no JSON needed ────────────────────────────────────────
+  if (t == MQTT_CMD_RESTART) {
+    Serial.println("Restart command received — rebooting");
+    publishStatus("offline");
+    mqtt.disconnect();
+    delay(200);
+    ESP.restart();
+    return;
+  }
+
+  // ── HTTP pull OTA ────────────────────────────────────────────────────────────
+  if (t == MQTT_CMD_OTA) {
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, length)) {
+      Serial.println("OTA: bad JSON");
+      publishStatus("error");
+      return;
+    }
+    const char* url = doc["url"] | "";
+    if (!strlen(url)) {
+      Serial.println("OTA: missing url field");
+      publishStatus("error");
+      return;
+    }
+    handleHttpOta(url);
+    return;
+  }
+
+  publishStatus("printing");
 
   if (t == MQTT_CMD_RAW) {
     char buf[length + 1];
@@ -142,7 +252,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   // Parse JSON for all other commands
-  StaticJsonDocument<4096> doc;
+  // JsonDocument is the ArduinoJson v7 replacement for StaticJsonDocument.
+  // It allocates from the heap and sizes itself automatically.
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
     Serial.printf("JSON parse error: %s\n", err.c_str());
@@ -312,7 +424,90 @@ void printImage(JsonDocument& doc) {
   if (cut) printer.feedAndCut();
 }
 
-// Raw ESC/POS — base64 encoded byte string
+// ── HTTP pull OTA ─────────────────────────────────────────────────────────────
+// Triggered via MQTT: {"url":"http://192.168.1.x:8080/firmware.bin"}
+// The ESP fetches the binary over HTTP, writes it to flash, then reboots.
+// Progress is reported to homeassistant/printer/ota/progress (0-100).
+void handleHttpOta(const char* url) {
+  Serial.printf("HTTP OTA starting: %s\n", url);
+  publishStatus("ota");
+  publishProgress(0);
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(30000);  // 30 s timeout for slow local servers
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("HTTP OTA: server returned %d\n", httpCode);
+    http.end();
+    publishStatus("error");
+    return;
+  }
+
+  int contentLen = http.getSize();
+  if (contentLen <= 0) {
+    Serial.println("HTTP OTA: unknown content length — continuing anyway");
+  }
+
+  if (!Update.begin(contentLen > 0 ? contentLen : UPDATE_SIZE_UNKNOWN)) {
+    Serial.println("HTTP OTA: not enough flash space");
+    Update.printError(Serial);
+    http.end();
+    publishStatus("error");
+    return;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buf[512];
+  int written = 0;
+  int lastReportedPct = -1;
+
+  while (http.connected() && (contentLen <= 0 || written < contentLen)) {
+    size_t available = stream->available();
+    if (!available) { delay(1); continue; }
+
+    size_t toRead = min(available, sizeof(buf));
+    size_t read   = stream->readBytes(buf, toRead);
+    size_t wr     = Update.write(buf, read);
+    if (wr != read) {
+      Serial.printf("HTTP OTA: write mismatch (%u vs %u)\n", wr, read);
+      break;
+    }
+    written += read;
+
+    if (contentLen > 0) {
+      int pct = (written * 100) / contentLen;
+      if (pct / 10 != lastReportedPct / 10) {
+        publishProgress(pct);
+        mqtt.loop();  // keep MQTT alive during long flash
+        lastReportedPct = pct;
+      }
+    }
+  }
+
+  http.end();
+
+  if (Update.end()) {
+    if (Update.isFinished()) {
+      Serial.println("HTTP OTA: success — rebooting");
+      publishProgress(100);
+      publishStatus("offline");
+      mqtt.disconnect();
+      delay(300);
+      ESP.restart();
+    } else {
+      Serial.println("HTTP OTA: update not finished");
+      publishStatus("error");
+    }
+  } else {
+    Serial.printf("HTTP OTA error: ");
+    Update.printError(Serial);
+    publishStatus("error");
+  }
+}
+
+// ── Raw ESC/POS ───────────────────────────────────────────────────────────────
 void printRaw(const char* b64) {
   String decoded = base64Decode(b64);
   printerSerial.write((const uint8_t*)decoded.c_str(), decoded.length());

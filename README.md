@@ -21,10 +21,12 @@ Home Assistant / CLI
 |---------------|---------------|---------------------------|
 | 5V            | VCC (red)     | Printer needs 5–9V        |
 | GND           | GND (black)   | Common ground             |
-| D6 / GPIO21   | RX (white)    | ESP32 TX → Printer RX     |
-| D7 / GPIO20   | TX (green)    | ESP32 RX ← Printer TX     |
+| **D6** / GPIO21 | RX (white)  | ESP32 TX → Printer RX     |
+| **D7** / GPIO20 | TX (green)  | ESP32 RX ← Printer TX     |
 
-> **Note:** The QR204 typically ships at **9600 baud**. Check your printer's DIP switches or config sheet. Update `PRINTER_BAUD` in `main.cpp` if yours is different (some ship at 115200).
+> **Pin labels:** On the XIAO ESP32-C3 silkscreen, **D6 is the TX pin (GPIO21)** and **D7 is the RX pin (GPIO20)**. Wire D6 to the printer's RX line and D7 to the printer's TX line.
+
+> **Baud rate:** The QR204 typically ships at **9600 baud**. Check your printer's DIP switches or config sheet. Update `PRINTER_BAUD` in `main.cpp` if yours is different (some units ship at 115200).
 
 ---
 
@@ -147,7 +149,61 @@ shell_command:
 
 ---
 
-## HA Dashboard Button Examples
+## OTA Updates
+
+Two methods are available so you never need to physically touch the device again after the first USB flash.
+
+### Method 1 — ArduinoOTA (push from your dev machine)
+
+PlatformIO pushes the compiled binary directly to the ESP32 over WiFi using the `espota` protocol.
+
+```bash
+# Build and upload wirelessly — use the _ota environment defined in platformio.ini
+pio run -e seeed_xiao_esp32c3_ota -t upload
+```
+
+- Set `upload_port` in `platformio.ini` to your device's IP (printed to serial on boot).
+- Set `--auth` in `upload_flags` to match `OTA_PASSWORD` in `secrets.h`.
+- The device appears as `esp32-printer` in Arduino IDE's network ports too.
+
+### Method 2 — HTTP pull OTA (triggered via MQTT)
+
+Host the compiled `.bin` anywhere on your local network (a simple Python HTTP server works fine), then trigger the update via MQTT. The ESP fetches and flashes itself, then reboots.
+
+**Step 1 — Serve the binary:**
+```bash
+# In the project folder after building
+cd .pio/build/seeed_xiao_esp32c3
+python3 -m http.server 8080
+```
+
+**Step 2 — Publish the OTA command:**
+```bash
+# Via mosquitto_pub
+mosquitto_pub -h 192.168.1.x -u mqtt_user -P mqtt_pass \
+  -t homeassistant/printer/cmd/ota \
+  -m '{"url":"http://192.168.1.YOUR_PC:8080/firmware.bin"}'
+
+# Or via the HA Developer Tools → Services → mqtt.publish
+```
+
+**Step 3 — Watch progress:**
+- `homeassistant/printer/status` → `"ota"` while flashing
+- `homeassistant/printer/ota/progress` → `0` … `100`
+- `homeassistant/printer/status` → `"online"` after reboot
+- `homeassistant/printer/version` → updated version string
+
+### Remote restart
+
+If you ever need a clean reboot without a firmware change:
+```bash
+mosquitto_pub -h 192.168.1.x -u mqtt_user -P mqtt_pass \
+  -t homeassistant/printer/cmd/restart -m "reboot"
+```
+
+---
+
+
 
 ```yaml
 # Lovelace card
