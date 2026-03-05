@@ -1,0 +1,169 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Home Assistant — QR204 Thermal Printer Integration
+# Add these sections to your configuration.yaml (or split into packages)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── 1. MQTT Sensors ────────────────────────────────────────────────────────────
+mqtt:
+  sensor:
+    - name: "Printer Status"
+      unique_id: qr204_status
+      state_topic: "homeassistant/printer/status"
+      icon: mdi:printer
+
+    - name: "Printer Paper"
+      unique_id: qr204_paper
+      state_topic: "homeassistant/printer/paper"
+      icon: mdi:paper-roll
+
+# ── 2. Scripts ─────────────────────────────────────────────────────────────────
+script:
+
+  # ── Print a custom message ──────────────────────────────────────────────────
+  printer_custom_message:
+    alias: "Printer: Custom Message"
+    description: "Print any text message. Fields: text, bold, size (1-4), align (left/center/right)"
+    fields:
+      text:
+        description: "Text to print"
+        example: "Hello from Home Assistant!"
+      bold:
+        description: "Bold text (true/false)"
+        default: false
+      size:
+        description: "Text size 1-4"
+        default: 1
+      align:
+        description: "Alignment: left, center, right"
+        default: "left"
+    sequence:
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/printer/cmd/text"
+          payload_template: >
+            {
+              "text": "{{ text }}",
+              "bold": {{ bold | default(false) | lower }},
+              "size": {{ size | default(1) }},
+              "align": "{{ align | default('left') }}",
+              "cut": true
+            }
+
+  # ── Print shopping list from the `shopping_list` integration ────────────────
+  printer_shopping_list:
+    alias: "Printer: Shopping List"
+    description: "Prints the current HA shopping list"
+    sequence:
+      - variables:
+          items: "{{ states.todo.shopping_list.attributes.items | default([]) }}"
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/printer/cmd/shopping"
+          payload_template: >
+            {
+              "title": "Shopping List",
+              "items": [
+                {% for item in items %}
+                  "{{ item.summary }}"{% if not loop.last %},{% endif %}
+                {% endfor %}
+              ],
+              "cut": true
+            }
+
+  # ── Print WiFi QR code ──────────────────────────────────────────────────────
+  printer_wifi_qr:
+    alias: "Printer: WiFi QR Code"
+    description: "Prints a QR code to join your WiFi network"
+    fields:
+      ssid:
+        description: "WiFi SSID"
+        example: "MyHomeWiFi"
+      password:
+        description: "WiFi password"
+        example: "secret123"
+      security:
+        description: "Security type: WPA, WEP, or nopass"
+        default: "WPA"
+    sequence:
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/printer/cmd/qrcode"
+          payload_template: >
+            {
+              "data": "WIFI:T:{{ security | default('WPA') }};S:{{ ssid }};P:{{ password }};;",
+              "label": "Join {{ ssid }}",
+              "size": 7,
+              "cut": true
+            }
+
+  # ── Print recipe from Mealie ────────────────────────────────────────────────
+  # Requires the Mealie HA integration or a REST command to fetch recipe data.
+  # Call this script with the recipe slug, or use the automation below.
+  printer_mealie_recipe:
+    alias: "Printer: Mealie Recipe"
+    description: "Print a recipe fetched from Mealie"
+    fields:
+      recipe_name:
+        description: "Recipe display name"
+      servings:
+        description: "Number of servings"
+      time:
+        description: "Cook time string"
+      ingredients:
+        description: "List of ingredient strings"
+      steps:
+        description: "List of instruction strings"
+    sequence:
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/printer/cmd/recipe"
+          payload_template: >
+            {
+              "name":        "{{ recipe_name }}",
+              "servings":    "{{ servings | default('') }}",
+              "time":        "{{ time | default('') }}",
+              "ingredients": [
+                {% for i in ingredients %}
+                  "{{ i }}"{% if not loop.last %},{% endif %}
+                {% endfor %}
+              ],
+              "steps": [
+                {% for s in steps %}
+                  "{{ s }}"{% if not loop.last %},{% endif %}
+                {% endfor %}
+              ],
+              "cut": true
+            }
+
+# ── 3. REST Commands (for Mealie API) ─────────────────────────────────────────
+rest_command:
+  mealie_get_recipe:
+    url: "http://YOUR_MEALIE_HOST:9000/api/recipes/{{ slug }}"
+    method: GET
+    headers:
+      Authorization: "Bearer YOUR_MEALIE_API_TOKEN"
+      Content-Type: "application/json"
+
+# ── 4. Automations ─────────────────────────────────────────────────────────────
+automation:
+
+  # Example: Print shopping list via a physical button (replace entity_id)
+  - alias: "Print Shopping List on Button Press"
+    trigger:
+      - platform: state
+        entity_id: input_button.print_shopping_list
+    action:
+      - service: script.printer_shopping_list
+
+  # Example: Print a daily reminder at 8am
+  - alias: "Printer Morning Reminder"
+    trigger:
+      - platform: time
+        at: "08:00:00"
+    action:
+      - service: script.printer_custom_message
+        data:
+          text: "Good morning! Check your calendar today."
+          bold: true
+          size: 2
+          align: center
