@@ -10,14 +10,14 @@ public:
   explicit ESCPOSPrinter(HardwareSerial& serial) : _s(serial) {}
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
+  // NOTE: The QR204 does not require ESC @ initialisation — sending it can
+  // disrupt the printer state. begin() is kept as a hook for future use.
   void begin() {
-    delay(200);
-    _s.write(0x1B); _s.write(0x40);  // ESC @ — initialize
-    delay(100);
+    delay(500);  // Give printer time to power up before first byte
   }
 
   void reset() {
-    _s.write(0x1B); _s.write(0x40);
+    delay(100);  // Soft pause instead of ESC @ which can upset the QR204
   }
 
   // ── Text formatting ────────────────────────────────────────────────────────
