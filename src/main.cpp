@@ -36,7 +36,7 @@
  *   homeassistant/printer/ota/progress   - 0-100 during HTTP OTA
  */
 
-#define FIRMWARE_VERSION "1.2.0"  // Confirmed working: 9600 baud, inverted TTL
+#define FIRMWARE_VERSION "1.2.6"  // word wrap working, debug removed
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -89,6 +89,8 @@ void printImage(JsonDocument& doc);
 void printRaw(const char* b64);
 void sendDiagnose();
 void handleHttpOta(const char* url);
+String wordWrap(const char* text, int cols);
+String wrapForSize(const char* text, int size);
 void publishStatus(const char* status);
 void publishProgress(int pct);
 String base64Decode(const char* encoded);
@@ -267,6 +269,86 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   publishStatus("online");
 }
 
+// ── Word wrap ─────────────────────────────────────────────────────────────────
+// Characters per line measured from calibration print:
+//   Size 1 (normal) → 32 chars
+//   Size 2 (double) → 16 chars
+//   Size 3 (large)  → 16 chars
+static const int CHARS_PER_LINE[] = { 0, 32, 16, 16 };  // index = size (1-3)
+
+// Wraps `text` to `cols` characters, breaking only on word boundaries.
+// Splits input into words, then greedily fills lines.
+String wordWrap(const char* text, int cols) {
+  if (cols <= 0) return String(text);
+
+  // ── Split input into tokens ───────────────────────────────────────────────
+  // Static storage — these arrays are too large for the ESP32-C3's 8KB stack.
+  static const int MAX_WORDS   = 200;
+  static const int MAX_WORD_LEN = 64;
+  static char  words[MAX_WORDS][MAX_WORD_LEN];
+  static bool  isNewline[MAX_WORDS];
+  static int   wordLens[MAX_WORDS];
+  int wordCount = 0;
+
+  const char* p = text;
+  while (*p && wordCount < MAX_WORDS) {
+    if (*p == '\n') {
+      words[wordCount][0] = '\0';
+      wordLens[wordCount] = 0;
+      isNewline[wordCount] = true;
+      wordCount++;
+      p++;
+    } else if (*p == ' ') {
+      p++;
+    } else {
+      const char* start = p;
+      while (*p && *p != ' ' && *p != '\n') p++;
+      int len = (int)(p - start);
+      if (len >= MAX_WORD_LEN) len = MAX_WORD_LEN - 1;
+      memcpy(words[wordCount], start, len);
+      words[wordCount][len] = '\0';
+      wordLens[wordCount] = len;
+      isNewline[wordCount] = false;
+      wordCount++;
+    }
+  }
+
+  // ── Greedy line fill ───────────────────────────────────────────────────────
+  String result;
+  int lineLen = 0;
+
+  for (int i = 0; i < wordCount; i++) {
+    if (isNewline[i]) {
+      result += '\n';
+      lineLen = 0;
+      continue;
+    }
+
+    int wlen = wordLens[i];
+
+    if (lineLen == 0) {
+      result += words[i];
+      lineLen = wlen;
+    } else if (lineLen + 1 + wlen <= cols) {
+      result += ' ';
+      result += words[i];
+      lineLen += 1 + wlen;
+    } else {
+      result += '\n';
+      result += words[i];
+      lineLen = wlen;
+    }
+  }
+
+  return result;
+}
+
+// Convenience: wraps text for a given printer size (1-3)
+String wrapForSize(const char* text, int size) {
+  int clampedSize = (size < 1) ? 1 : (size > 3) ? 3 : size;
+  return wordWrap(text, CHARS_PER_LINE[clampedSize]);
+}
+
 // ── Print handlers ────────────────────────────────────────────────────────────
 
 void printText(JsonDocument& doc) {
@@ -276,10 +358,19 @@ void printText(JsonDocument& doc) {
   const char* align = doc["align"] | "left";
   bool cut          = doc["cut"]   | true;
 
+  String wrapped = wrapForSize(text, size);
+
   printer.setAlign(align);
   printer.setSize(size);
   if (bold) printer.setBold(true);
-  printer.println(text);
+  int start = 0;
+  for (int i = 0; i <= (int)wrapped.length(); i++) {
+    if (i == (int)wrapped.length() || wrapped[i] == '\n') {
+      String line = wrapped.substring(start, i);
+      printer.println(line.c_str());
+      start = i + 1;
+    }
+  }
   if (bold) printer.setBold(false);
   printer.reset();
   if (cut) printer.feedAndCut();
@@ -289,21 +380,48 @@ void printShopping(JsonDocument& doc) {
   const char* title = doc["title"] | "Shopping List";
   bool cut          = doc["cut"]   | true;
 
+  // Title at size 2 — wrap to 21 chars
+  String wrappedTitle = wrapForSize(title, 2);
   printer.setAlign("center");
   printer.setSize(2);
   printer.setBold(true);
-  printer.println(title);
+  printer.println(wrappedTitle.c_str());
   printer.setBold(false);
   printer.setSize(1);
-  printer.println("──────────────────────");
+  printer.println("--------------------------------");  // 32 dashes
   printer.setAlign("left");
 
   JsonArray items = doc["items"].as<JsonArray>();
   int i = 1;
   for (JsonVariant item : items) {
+    // Number prefix takes 4 chars (" 1. "), leaving 38 for the item text
+    // Subsequent wrapped lines indent by 4 spaces to align under text
+    const char* itemText = item.as<const char*>();
+    char numPrefix[6];
+    snprintf(numPrefix, sizeof(numPrefix), "%2d. ", i++);
+
+    String wrapped = wordWrap(itemText, 28);  // 32 - 4 char prefix
+
+    // First line: with number prefix
+    int nlPos = wrapped.indexOf('\n');
+    String firstLine = (nlPos >= 0) ? wrapped.substring(0, nlPos) : wrapped;
+    String rest      = (nlPos >= 0) ? wrapped.substring(nlPos + 1) : "";
+
     char line[64];
-    snprintf(line, sizeof(line), "%2d. %s", i++, item.as<const char*>());
+    snprintf(line, sizeof(line), "%s%s", numPrefix, firstLine.c_str());
     printer.println(line);
+
+    // Continuation lines: indented 4 spaces
+    int rStart = 0;
+    for (int r = 0; r <= (int)rest.length(); r++) {
+      if (r == (int)rest.length() || rest[r] == '\n') {
+        if (r > rStart) {
+          String seg = "    " + rest.substring(rStart, r);
+          printer.println(seg.c_str());
+        }
+        rStart = r + 1;
+      }
+    }
   }
 
   printer.println("");
@@ -321,10 +439,12 @@ void printRecipe(JsonDocument& doc) {
   const char* time     = doc["time"]     | "";
   bool cut             = doc["cut"]      | true;
 
+  // Name at size 2 (21 chars wide)
   printer.setAlign("center");
   printer.setSize(2);
   printer.setBold(true);
-  printer.println(name);
+  String wrappedName = wrapForSize(name, 2);
+  printer.println(wrappedName.c_str());
   printer.setBold(false);
   printer.setSize(1);
 
@@ -334,28 +454,59 @@ void printRecipe(JsonDocument& doc) {
     if (strlen(time))     snprintf(meta + strlen(meta), sizeof(meta) - strlen(meta), "  Time: %s", time);
     printer.println(meta);
   }
-  printer.println("──────────────────────");
+  printer.println("--------------------------------");
 
+  // Ingredients at size 1 (42 chars), prefix "  * " = 4 chars → 38 for text
   printer.setAlign("left");
   printer.setBold(true);
   printer.println("INGREDIENTS");
   printer.setBold(false);
   for (JsonVariant ing : doc["ingredients"].as<JsonArray>()) {
-    char line[64];
-    snprintf(line, sizeof(line), "  * %s", ing.as<const char*>());
-    printer.println(line);
+    String wrapped = wordWrap(ing.as<const char*>(), 28);  // 32 - 4 char prefix
+    int start = 0;
+    bool first = true;
+    for (int i = 0; i <= (int)wrapped.length(); i++) {
+      if (i == (int)wrapped.length() || wrapped[i] == '\n') {
+        String seg = wrapped.substring(start, i);
+        String line = (first ? "  * " : "    ") + seg;
+        printer.println(line.c_str());
+        first = false;
+        start = i + 1;
+      }
+    }
   }
 
+  // Steps at size 1 (32 chars), prefix "N. " = 3+ chars
   printer.println("");
   printer.setBold(true);
   printer.println("STEPS");
   printer.setBold(false);
   int s = 1;
   for (JsonVariant step : doc["steps"].as<JsonArray>()) {
-    char num[8];
-    snprintf(num, sizeof(num), "%d.", s++);
-    printer.print(num);
-    printer.println(step.as<const char*>());
+    char numPrefix[6];
+    snprintf(numPrefix, sizeof(numPrefix), "%d. ", s++);
+    int prefixLen = strlen(numPrefix);
+    int wrapCols  = 32 - prefixLen;
+
+    String wrapped = wordWrap(step.as<const char*>(), wrapCols);
+    int start = 0;
+    bool first = true;
+    for (int i = 0; i <= (int)wrapped.length(); i++) {
+      if (i == (int)wrapped.length() || wrapped[i] == '\n') {
+        String seg = wrapped.substring(start, i);
+        if (first) {
+          String line = String(numPrefix) + seg;
+          printer.println(line.c_str());
+          first = false;
+        } else {
+          // Indent continuation lines to align under text
+          String indent(prefixLen, ' ');
+          String line = indent + seg;
+          printer.println(line.c_str());
+        }
+        start = i + 1;
+      }
+    }
     printer.println("");
   }
 
@@ -460,7 +611,7 @@ void handleHttpOta(const char* url) {
   while (http.connected() && (contentLen <= 0 || written < contentLen)) {
     size_t avail = stream->available();
     if (!avail) { delay(1); continue; }
-    size_t rd = stream->readBytes(otaBuf, min(avail, sizeof(otaBuf)));
+    size_t rd = stream->readBytes(otaBuf, min(avail, (size_t)sizeof(otaBuf)));
     if (Update.write(otaBuf, rd) != rd) break;
     written += rd;
     if (contentLen > 0) {
